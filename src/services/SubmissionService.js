@@ -1,13 +1,14 @@
 /**
  * The service to handle new submission events for MM challenge.
  */
-const _ = require('lodash');
-const config = require('config');
-const Joi = require('joi');
+const _ = require('lodash')
+const config = require('config')
+const Joi = require('joi')
 
-const logger = require('legacy-processor-module/common/logger');
-const Schema = require('legacy-processor-module/Schema');
-const LegacySubmissionIdService = require('legacy-processor-module/LegacySubmissionIdService');
+const logger = require('legacy-processor-module/common/logger')
+const Schema = require('legacy-processor-module/Schema')
+const LegacySubmissionIdService = require('legacy-processor-module/LegacySubmissionIdService')
+const tracer = require('legacy-processor-module/common/tracer')
 
 // The event schema for "submission" resource
 const submissionSchema = Schema.createEventSchema({
@@ -20,7 +21,7 @@ const submissionSchema = Schema.createEventSchema({
   url: Joi.string()
     .uri()
     .required()
-});
+})
 
 // The event schema for "review" resource
 const reviewSchema = Schema.createEventSchema({
@@ -37,7 +38,7 @@ const reviewSchema = Schema.createEventSchema({
     })
     .unknown(true)
     .optional()
-});
+})
 
 // The event schema for "reviewSummation" resource
 const reviewSummationSchema = Schema.createEventSchema({
@@ -48,13 +49,13 @@ const reviewSummationSchema = Schema.createEventSchema({
     .min(0)
     .max(100)
     .required()
-});
+})
 
 const schemas = {
   submission: submissionSchema,
   review: reviewSchema,
   reviewSummation: reviewSummationSchema
-};
+}
 
 /**
  * Validate submission field
@@ -62,9 +63,9 @@ const schemas = {
  * @param {String} field the field name
  * @private
  */
-function validateSubmissionField(submission, field) {
+function validateSubmissionField (submission, field) {
   if (!submission[field]) {
-    throw new Error(`${field} not found for submission: ${submission.id}`);
+    throw new Error(`${field} not found for submission: ${submission.id}`)
   }
 }
 
@@ -74,111 +75,189 @@ function validateSubmissionField(submission, field) {
  * value is the submission got from Submission API (when event is from 'review' and 'reviewSummation' resources).
  *
  * @param {Object} event the kafka event
+ * @param {Object} parentSpan the parent span object
  * @returns {Array} [isMM, submission]
  * @private
  */
-async function checkMMChallenge(event) {
-  let challengeId;
-  let submission; // This is the submission got from Submission API
+async function checkMMChallenge (event, parentSpan = null) {
+  const span = tracer.buildSpans('SubmissionService.checkMMChallenge', parentSpan)
+  let challengeId
+  let submission // This is the submission got from Submission API
 
   try {
     if (event.payload.resource === 'submission') {
-      challengeId = event.payload.challengeId;
+      challengeId = event.payload.challengeId
     } else {
       // Event from 'review' and 'reviewSummation' resources does not have challengeId, but has submissionId instead
       // We at first get submission from Submission API, the get challengeId from it
       submission = await LegacySubmissionIdService.getSubmission(
-        event.payload.submissionId
-      );
-      validateSubmissionField(submission, 'challengeId');
-      challengeId = submission.challengeId;
+        event.payload.submissionId,
+        span
+      )
+      validateSubmissionField(submission, 'challengeId')
+      challengeId = submission.challengeId
     }
 
     // Validate subTrack to be MM
-    const subTrack = await LegacySubmissionIdService.getSubTrack(challengeId);
-    logger.debug(`Challenge get subTrack ${subTrack}`);
+    const subTrack = await LegacySubmissionIdService.getSubTrack(challengeId, span)
+    span.setTag('subTrack', subTrack)
+    logger.debug(`Challenge get subTrack ${subTrack}`)
     const challangeSubtracks = config.CHALLENGE_SUBTRACK.split(',').map(x =>
       x.trim()
-    );
+    )
     if (!(subTrack && challangeSubtracks.includes(subTrack))) {
       logger.debug(
         `Skipped as NOT MM found in ${JSON.stringify(challangeSubtracks)}`
-      );
-      return [false];
+      )
+      span.setTag('error', true)
+      span.log({
+        event: 'error',
+        message: `Skipped as NOT MM found in ${JSON.stringify(challangeSubtracks)}`
+      })
+      return [false]
     }
 
-    return [true, submission];
+    return [true, submission]
   } catch (error) {
     logger.error(
       `checkMMChallenge - Failed to handle ${JSON.stringify(event)}: ${
         error.message
       }`
-    );
-    logger.error(error);
-    throw error;
+    )
+    logger.error(error)
+    tracer.logSpanError(span, error)
+    throw error
+  } finally {
+    span.finish()
   }
 }
 
 /**
  * Handle new submission and update submission event.
  * @param {Object} event the event object
+ * @param {Object} parentSpan the parent span object
  */
-async function handle(event) {
+async function handle (event, parentSpan = null) {
+  const span = tracer.buildSpans('SubmissionService.handle', parentSpan)
+
   if (!event) {
-    logger.debug('Skipped null or empty event');
-    return;
+    logger.debug('Skipped null or empty event')
+    span.setTag('error', true)
+    span.log({
+      event: 'error',
+      message: 'Skipped null or empty event'
+    })
+    span.finish()
+    return
   }
 
   // Validate with common event schema
   if (!Schema.validateEvent(event, Schema.commonEventSchema)) {
-    return;
+    span.setTag('error', true)
+    span.log({
+      event: 'error',
+      message: 'Received event does not match expected common event schema',
+      eventReceived: event
+    })
+    span.finish()
+    return
   }
 
   // Validate with specific event schema
   const validationResult = Schema.validateEvent(
     event,
     schemas[event.payload.resource]
-  );
+  )
   if (!validationResult) {
-    return;
+    span.setTag('error', true)
+    span.log({
+      event: 'error',
+      message: 'Received event does not match expected specific schema',
+      eventReceived: event
+    })
+    span.finish()
+    return
   }
 
   // Check topic and originator
   if (event.topic !== config.KAFKA_AGGREGATE_SUBMISSION_TOPIC) {
-    logger.debug(`Skipped event from topic ${event.topic}`);
-    return;
+    logger.debug(`Skipped event from topic ${event.topic}`)
+    span.setTag('error', true)
+    span.log({
+      event: 'error',
+      message: `Skipped event from topic ${event.topic}`,
+      eventReceived: event
+    })
+    span.finish()
+    return
   }
 
   if (event.originator !== config.KAFKA_NEW_SUBMISSION_ORIGINATOR) {
-    logger.debug(`Skipped event from originator ${event.originator}`);
-    return;
+    logger.debug(`Skipped event from originator ${event.originator}`)
+    span.setTag('error', true)
+    span.log({
+      event: 'error',
+      message: `Skipped event from originator ${event.originator}`,
+      eventReceived: event
+    })
+    span.finish()
+    return
   }
+  span.setTag('originator', event.originator)
 
   if (event.payload.resource === 'review') {
-    const testType = _.get(event, 'payload.metadata.testType');
+    const testType = _.get(event, 'payload.metadata.testType')
     if (testType !== 'provisional') {
-      logger.debug(`Skipped non-provisional testType: ${testType}`);
-      return;
+      logger.debug(`Skipped non-provisional testType: ${testType}`)
+      span.setTag('error', true)
+      span.log({
+        event: 'error',
+        message: `Skipped non-provisional testType: ${testType}`,
+        eventReceived: event
+      })
+      span.finish()
+      return
     }
   }
 
   // Validate challenge is MM
-  const [isMM, submission] = await checkMMChallenge(event);
+  const [isMM, submission] = await checkMMChallenge(event, span)
   if (!isMM) {
     logger.debug(
       `submission ${submission} is not a marathon. skipping processing`
-    );
-    return;
+    )
+    span.setTag('error', true)
+    span.log({
+      event: 'error',
+      message: `submission ${submission} is not a marathon. skipping processing`,
+      eventReceived: event
+    })
+    span.finish()
+    return
   }
+
+  // If valid event, log the event and add tags
+  span.log({
+    event: 'debug',
+    message: 'Received valid event',
+    eventReceived: event
+  })
+  Object.keys(event.payload).forEach((key) => {
+    const valueType = typeof event.payload[key]
+    // Tag values can only be numbers, boolean or strings
+    if (valueType === 'number' || valueType === 'boolean' || valueType === 'string') {
+      span.setTag(key, event.payload[key])
+    }
+  })
 
   if (
     event.payload.resource === 'submission' &&
     event.payload.originalTopic === config.KAFKA_NEW_SUBMISSION_TOPIC
   ) {
     // Handle new submission
-    const timestamp = Date.parse(event.payload.created);
+    const timestamp = Date.parse(event.payload.created)
 
-    logger.debug(`Started adding submission for ${event.payload.id}`);
+    logger.debug(`Started adding submission for ${event.payload.id}`)
     try {
       const patchObject = await LegacySubmissionIdService.addMMSubmission(
         event.payload.id,
@@ -188,20 +267,24 @@ async function handle(event) {
         event.payload.url,
         event.payload.type,
         timestamp,
-        true
-      );
+        true,
+        span
+      )
 
       logger.debug(
         `Successfully processed MM message - Patched to the Submission API: id ${
           event.payload.id
         }, patch: ${JSON.stringify(patchObject)}`
-      );
+      )
+      span.finish()
     } catch (error) {
       logger.error(
         `Failed to handle ${JSON.stringify(event)}: ${error.message}`
-      );
-      logger.error(error);
-      throw error;
+      )
+      logger.error(error)
+      tracer.logSpanError(span, error)
+      span.finish()
+      throw error
     }
   } else if (
     event.payload.resource === 'submission' &&
@@ -209,24 +292,34 @@ async function handle(event) {
     event.payload.url
   ) {
     try {
-      let legacySubmissionId = event.payload.legacySubmissionId;
+      let legacySubmissionId = event.payload.legacySubmissionId
       if (!legacySubmissionId) {
         // In case legacySubmissionId not present, try to get it from submission API
         const submission = await LegacySubmissionIdService.getSubmission(
-          event.payload.id
-        );
+          event.payload.id,
+          span
+        )
 
         if (!submission.legacySubmissionId) {
+          span.setTag('error', true)
+          span.log({
+            event: 'error',
+            message: `legacySubmissionId not found for submission: ${submission.id}`,
+            eventReceived: event
+          })
+          span.finish()
+          logger.debug(`legacySubmissionId not found for submission: ${submission.id}`)
           throw new Error(
             `legacySubmissionId not found for submission: ${submission.id}`
-          );
+          )
         }
-        legacySubmissionId = submission.legacySubmissionId;
+        legacySubmissionId = submission.legacySubmissionId
+        span.setTag('legacySubmissionId', legacySubmissionId)
       }
 
       logger.debug(
         `Started updating URL for submission for ${legacySubmissionId}`
-      );
+      )
 
       await LegacySubmissionIdService.updateUpload(
         event.payload.challengeId,
@@ -234,32 +327,36 @@ async function handle(event) {
         event.payload.submissionPhaseId,
         event.payload.url,
         event.payload.type,
-        legacySubmissionId
-      );
+        legacySubmissionId,
+        span
+      )
 
       logger.debug(
         `Successfully processed MM message - Submission url updated, legacy submission id : ${legacySubmissionId} with url ${
           event.payload.url
         }`
-      );
+      )
+      span.finish()
     } catch (error) {
       logger.error(
         `Update URL - Failed to handle ${JSON.stringify(event)}: ${
           error.message
         }`
-      );
-      logger.error(error);
-      throw error;
+      )
+      logger.error(error)
+      tracer.logSpanError(span, error)
+      span.finish()
+      throw error
     }
   } else if (event.payload.resource === 'review') {
     // Handle provisional score
 
     // Validate required fields of submission
     try {
-      validateSubmissionField(submission, 'memberId');
-      validateSubmissionField(submission, 'submissionPhaseId');
-      validateSubmissionField(submission, 'type');
-      validateSubmissionField(submission, 'legacySubmissionId');
+      validateSubmissionField(submission, 'memberId')
+      validateSubmissionField(submission, 'submissionPhaseId')
+      validateSubmissionField(submission, 'type')
+      validateSubmissionField(submission, 'legacySubmissionId')
 
       await LegacySubmissionIdService.updateProvisionalScore(
         submission.challengeId,
@@ -267,43 +364,51 @@ async function handle(event) {
         submission.submissionPhaseId,
         submission.legacySubmissionId,
         submission.type,
-        event.payload.score
-      );
+        event.payload.score,
+        span
+      )
 
       logger.debug(
         'Successfully processed MM message - Provisional score updated'
-      );
+      )
+      span.finish()
     } catch (error) {
       logger.error(
         `Failed to handle ${JSON.stringify(event)}: ${error.message}`
-      );
-      logger.error(error);
-      throw error;
+      )
+      logger.error(error)
+      tracer.logSpanError(span, error)
+      span.finish()
+      throw error
     }
   } else if (event.payload.resource === 'reviewSummation') {
     // Handle final score
     // Validate required fields of submission
     try {
-      validateSubmissionField(submission, 'memberId');
-      validateSubmissionField(submission, 'legacySubmissionId');
+      validateSubmissionField(submission, 'memberId')
+      validateSubmissionField(submission, 'legacySubmissionId')
 
       await LegacySubmissionIdService.updateFinalScore(
         submission.challengeId,
         submission.memberId,
         submission.legacySubmissionId,
-        event.payload.aggregateScore
-      );
-      logger.debug('Successfully processed MM message - Final score updated');
+        event.payload.aggregateScore,
+        span
+      )
+      logger.debug('Successfully processed MM message - Final score updated')
+      span.finish()
     } catch (error) {
       logger.error(
         `Failed to handle ${JSON.stringify(event)}: ${error.message}`
-      );
-      logger.error(error);
-      throw error;
+      )
+      logger.error(error)
+      tracer.logSpanError(span, error)
+      span.finish()
+      throw error
     }
   }
 }
 
 module.exports = {
   handle
-};
+}

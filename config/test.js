@@ -19,7 +19,7 @@ module.exports = {
   // The client cert key, can be (1) the path to the cert key file, or (2) the cert key content
   KAFKA_CLIENT_CERT_KEY: './docker/kafka/kafka-ssl/client.key',
 
-  // The topic from which the app consumes events
+  // New submission topic
   KAFKA_NEW_SUBMISSION_TOPIC: 'submission.notification.create',
 
   // The event originator
